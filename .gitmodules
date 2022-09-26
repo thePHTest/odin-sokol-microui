@@ -1,0 +1,3 @@
+[submodule "deps/sokol-odin"]
+	path = deps/sokol-odin
+	url = git@github.com:thePHTest/sokol-odin.git
