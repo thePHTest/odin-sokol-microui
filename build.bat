@@ -13,7 +13,8 @@ if "%1" == "1" (
 	set release_mode=0
 )
 
-set compiler_flags=-strict-style
+set collections=-collection:sokol=../deps/sokol-odin/sokol
+set compiler_flags=-strict-style %collections%
 
 if %release_mode% EQU 0 ( rem Debug
     set compiler_flags=%compiler_flags% -debug

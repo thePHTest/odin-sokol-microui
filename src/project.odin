@@ -1,216 +1,259 @@
-package microui_sdl
+package microui_sokol
 
-import "core:fmt"
 import "core:c/libc"
-import SDL "vendor:sdl2"
+import "core:fmt"
+import "core:runtime"
+import "core:unicode/utf8"
+import sg "sokol:gfx"
+import sa "sokol:app"
+import sgl "sokol:gl"
+import s_glue "sokol:glue"
 import mu "vendor:microui"
 
 state := struct {
+	pip:             sgl.Pipeline,
 	mu_ctx:          mu.Context,
 	log_buf:         [1 << 16]byte,
 	log_buf_len:     int,
 	log_buf_updated: bool,
 	bg:              mu.Color,
-	atlas_texture:   ^SDL.Texture,
+	atlas_img:       sg.Image,
 } {
 	bg = {90, 95, 100, 255},
 }
 
-main :: proc() {
-	if err := SDL.Init({.VIDEO}); err != 0 {
-		fmt.eprintln(err)
-		return
-	}
-	defer SDL.Quit()
-
-	window := SDL.CreateWindow(
-		"microui-odin",
-		SDL.WINDOWPOS_UNDEFINED,
-		SDL.WINDOWPOS_UNDEFINED,
-		960,
-		540,
-		{.SHOWN, .RESIZABLE},
-	)
-	if window == nil {
-		fmt.eprintln(SDL.GetError())
-		return
-	}
-	defer SDL.DestroyWindow(window)
-
-	backend_idx: i32 = -1
-	if n := SDL.GetNumRenderDrivers(); n <= 0 {
-		fmt.eprintln("No render drivers available")
-		return
-	} else {
-		for i in 0 ..< n {
-			info: SDL.RendererInfo
-			if err := SDL.GetRenderDriverInfo(i, &info); err == 0 {
-				// NOTE(bill): "direct3d" seems to not work correctly
-				if info.name == "opengl" {
-					backend_idx = i
-					break
-				}
-			}
-		}
-	}
-
-	renderer := SDL.CreateRenderer(window, backend_idx, {.ACCELERATED, .PRESENTVSYNC})
-	if renderer == nil {
-		fmt.eprintln("SDL.CreateRenderer:", SDL.GetError())
-		return
-	}
-	defer SDL.DestroyRenderer(renderer)
-
-	state.atlas_texture = SDL.CreateTexture(
-		renderer,
-		u32(SDL.PixelFormatEnum.RGBA32),
-		.TARGET,
-		mu.DEFAULT_ATLAS_WIDTH,
-		mu.DEFAULT_ATLAS_HEIGHT,
-	)
-	assert(state.atlas_texture != nil)
-	if err := SDL.SetTextureBlendMode(state.atlas_texture, .BLEND); err != 0 {
-		fmt.eprintln("SDL.SetTextureBlendMode:", err)
-		return
-	}
-
+r_init :: proc() {
 	pixels := make([][4]u8, mu.DEFAULT_ATLAS_WIDTH * mu.DEFAULT_ATLAS_HEIGHT)
 	for alpha, i in mu.default_atlas_alpha {
 		pixels[i].rgb = 0xff
 		pixels[i].a = alpha
 	}
 
-	if err := SDL.UpdateTexture(
-		   state.atlas_texture,
-		   nil,
-		   raw_data(pixels),
-		   4 * mu.DEFAULT_ATLAS_WIDTH,
-	   ); err != 0 {
-		fmt.eprintln("SDL.UpdateTexture:", err)
-		return
-	}
+	state.atlas_img = sg.make_image(
+		sg.Image_Desc{
+			width = mu.DEFAULT_ATLAS_WIDTH,
+			height = mu.DEFAULT_ATLAS_HEIGHT,
+			min_filter = .NEAREST,
+			mag_filter = .NEAREST,
+			data = {
+				subimage = {
+					0 = {
+						0 = {
+							ptr = raw_data(pixels),
+							size = mu.DEFAULT_ATLAS_WIDTH * mu.DEFAULT_ATLAS_HEIGHT * 4,
+						},
+					},
+				},
+			},
+		},
+	)
+
+	state.pip = sgl.make_pipeline(
+		sg.Pipeline_Desc{
+			colors = {
+				0 = {
+					blend = {
+						enabled = true,
+						src_factor_rgb = .SRC_ALPHA,
+						dst_factor_rgb = .ONE_MINUS_SRC_ALPHA,
+					},
+				},
+			},
+		},
+	)
+
+	free(raw_data(pixels))
+}
+
+init :: proc "c" () {
+	context = runtime.default_context()
+
+	sg.setup(sg.Desc{ctx = s_glue.ctx()})
+	sgl.setup({})
+
+	r_init()
 
 	ctx := &state.mu_ctx
 	mu.init(ctx)
 
 	ctx.text_width = mu.default_atlas_text_width
 	ctx.text_height = mu.default_atlas_text_height
+}
 
-	main_loop: for {
-		for e: SDL.Event; SDL.PollEvent(&e); {
-			#partial switch e.type {
-			case .QUIT:
-				break main_loop
-			case .MOUSEMOTION:
-				mu.input_mouse_move(ctx, e.motion.x, e.motion.y)
-			case .MOUSEWHEEL:
-				mu.input_scroll(ctx, e.wheel.x * 30, e.wheel.y * -30)
-			case .TEXTINPUT:
-				mu.input_text(ctx, string(cstring(&e.text.text[0])))
+r_begin :: proc(disp_width, disp_height: i32) {
+	sgl.defaults()
+	sgl.push_pipeline()
+	sgl.load_pipeline(state.pip)
+	sgl.enable_texture()
+	sgl.texture(state.atlas_img)
+	sgl.matrix_mode_projection()
+	sgl.push_matrix()
+	sgl.ortho(0.0, f32(disp_width), f32(disp_height), 0.0, -1.0, +1.0)
+	sgl.begin_quads()
+}
 
-			case .MOUSEBUTTONDOWN, .MOUSEBUTTONUP:
-				fn := mu.input_mouse_down if e.type == .MOUSEBUTTONDOWN else mu.input_mouse_up
-				switch e.button.button {
-				case SDL.BUTTON_LEFT:
-					fn(ctx, e.button.x, e.button.y, .LEFT)
-				case SDL.BUTTON_MIDDLE:
-					fn(ctx, e.button.x, e.button.y, .MIDDLE)
-				case SDL.BUTTON_RIGHT:
-					fn(ctx, e.button.x, e.button.y, .RIGHT)
-				}
+r_push_quad :: proc(dst: mu.Rect, src: mu.Rect, color: mu.Color) {
+	u0 := f32(src.x) / f32(mu.DEFAULT_ATLAS_WIDTH)
+	v0 := f32(src.y) / f32(mu.DEFAULT_ATLAS_HEIGHT)
+	u1 := f32(src.x + src.w) / f32(mu.DEFAULT_ATLAS_WIDTH)
+	v1 := f32(src.y + src.h) / f32(mu.DEFAULT_ATLAS_HEIGHT)
 
-			case .KEYDOWN, .KEYUP:
-				if e.type == .KEYUP && e.key.keysym.sym == .ESCAPE {
-					SDL.PushEvent(&SDL.Event{type = .QUIT})
-				}
+	x0 := f32(dst.x)
+	y0 := f32(dst.y)
+	x1 := f32(dst.x + dst.w)
+	y1 := f32(dst.y + dst.h)
 
-				fn := mu.input_key_down if e.type == .KEYDOWN else mu.input_key_up
+	sgl.c4b(color.r, color.g, color.b, color.a)
+	sgl.v2f_t2f(x0, y0, u0, v0)
+	sgl.v2f_t2f(x1, y0, u1, v0)
+	sgl.v2f_t2f(x1, y1, u1, v1)
+	sgl.v2f_t2f(x0, y1, u0, v1)
+}
 
-				#partial switch e.key.keysym.sym {
-				case .LSHIFT:
-					fn(ctx, .SHIFT)
-				case .RSHIFT:
-					fn(ctx, .SHIFT)
-				case .LCTRL:
-					fn(ctx, .CTRL)
-				case .RCTRL:
-					fn(ctx, .CTRL)
-				case .LALT:
-					fn(ctx, .ALT)
-				case .RALT:
-					fn(ctx, .ALT)
-				case .RETURN:
-					fn(ctx, .RETURN)
-				case .KP_ENTER:
-					fn(ctx, .RETURN)
-				case .BACKSPACE:
-					fn(ctx, .BACKSPACE)
-				}
-			}
-		}
-
-		mu.begin(ctx)
-		all_windows(ctx)
-		mu.end(ctx)
-
-		render(ctx, renderer)
+r_draw_text :: proc(text: string, pos: mu.Vec2, color: mu.Color) {
+	dst := mu.Rect{pos.x, pos.y, 0, 0}
+	for ch in text {
+		src := mu.default_atlas[mu.DEFAULT_ATLAS_FONT + int(ch)]
+		dst.w = src.w
+		dst.h = src.h
+		r_push_quad(dst, src, color)
+		dst.x += dst.w
 	}
 }
 
-render :: proc(ctx: ^mu.Context, renderer: ^SDL.Renderer) {
-	render_texture :: proc(
-		renderer: ^SDL.Renderer,
-		dst: ^SDL.Rect,
-		src: mu.Rect,
-		color: mu.Color,
-	) {
-		dst.w = src.w
-		dst.h = src.h
+r_draw_rect :: proc(rect: mu.Rect, color: mu.Color) {
+	r_push_quad(rect, mu.default_atlas[mu.DEFAULT_ATLAS_WHITE], color)
+}
 
-		SDL.SetTextureAlphaMod(state.atlas_texture, color.a)
-		SDL.SetTextureColorMod(state.atlas_texture, color.r, color.g, color.b)
-		SDL.RenderCopy(renderer, state.atlas_texture, &SDL.Rect{src.x, src.y, src.w, src.h}, dst)
-	}
+r_draw_icon :: proc(id: mu.Icon, rect: mu.Rect, color: mu.Color) {
+	src := mu.default_atlas[id]
+	x := rect.x + (rect.w - src.w) / 2
+	y := rect.y + (rect.h - src.h) / 2
+	r_push_quad(mu.Rect{x, y, src.w, src.h}, src, color)
+}
 
-	viewport_rect := &SDL.Rect{}
-	SDL.GetRendererOutputSize(renderer, &viewport_rect.w, &viewport_rect.h)
-	SDL.RenderSetViewport(renderer, viewport_rect)
-	SDL.RenderSetClipRect(renderer, viewport_rect)
-	SDL.SetRenderDrawColor(renderer, state.bg.r, state.bg.g, state.bg.b, state.bg.a)
-	SDL.RenderClear(renderer)
+r_set_clip_rect :: proc(rect: mu.Rect) {
+	sgl.end()
+	sgl.scissor_rect(rect.x, rect.y, rect.w, rect.h, true)
+	sgl.begin_quads()
+}
 
+r_end :: proc() {
+	sgl.end()
+	sgl.pop_matrix()
+	sgl.pop_pipeline()
+}
+
+r_draw :: proc() {
+	sgl.draw()
+}
+
+frame :: proc "c" () {
+	context = runtime.default_context()
+
+	mu_ctx := &state.mu_ctx
+	mu.begin(mu_ctx)
+	all_windows(mu_ctx)
+	mu.end(mu_ctx)
+
+	r_begin(sa.width(), sa.height())
 	command_backing: ^mu.Command
-	for variant in mu.next_command_iterator(ctx, &command_backing) {
+	for variant in mu.next_command_iterator(mu_ctx, &command_backing) {
 		switch cmd in variant {
 		case ^mu.Command_Text:
-			dst := SDL.Rect{cmd.pos.x, cmd.pos.y, 0, 0}
-			for ch in cmd.str do if ch & 0xc0 != 0x80 {
-					r := min(int(ch), 127)
-					src := mu.default_atlas[mu.DEFAULT_ATLAS_FONT + r]
-					render_texture(renderer, &dst, src, cmd.color)
-					dst.x += dst.w
-				}
+			r_draw_text(cmd.str, cmd.pos, cmd.color)
 		case ^mu.Command_Rect:
-			SDL.SetRenderDrawColor(renderer, cmd.color.r, cmd.color.g, cmd.color.b, cmd.color.a)
-			SDL.RenderFillRect(renderer, &SDL.Rect{cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h})
+			r_draw_rect(cmd.rect, cmd.color)
 		case ^mu.Command_Icon:
-			src := mu.default_atlas[cmd.id]
-			x := cmd.rect.x + (cmd.rect.w - src.w) / 2
-			y := cmd.rect.y + (cmd.rect.h - src.h) / 2
-			render_texture(renderer, &SDL.Rect{x, y, 0, 0}, src, cmd.color)
+			r_draw_icon(cmd.id, cmd.rect, cmd.color)
 		case ^mu.Command_Clip:
-			SDL.RenderSetClipRect(
-				renderer,
-				&SDL.Rect{cmd.rect.x, cmd.rect.y, cmd.rect.w, cmd.rect.h},
-			)
+			r_set_clip_rect(cmd.rect)
 		case ^mu.Command_Jump:
 			unreachable()
 		}
 	}
+	r_end()
 
-	SDL.RenderPresent(renderer)
+	sg.begin_default_pass(
+		sg.Pass_Action{
+			colors = {
+				0 = {
+					action = .CLEAR,
+					value = {
+						f32(state.bg.r) / 255.0,
+						f32(state.bg.g) / 255.0,
+						f32(state.bg.b) / 255.0,
+						1.0,
+					},
+				},
+			},
+		},
+		sa.width(),
+		sa.height(),
+	)
+
+	r_draw()
+	sg.end_pass()
+	sg.commit()
 }
 
+key_map := map[sa.Keycode]mu.Key {
+	.LEFT_SHIFT    = .SHIFT,
+	.RIGHT_SHIFT   = .SHIFT,
+	.LEFT_CONTROL  = .CTRL,
+	.RIGHT_CONTROL = .CTRL,
+	.LEFT_ALT      = .ALT,
+	.RIGHT_ALT     = .ALT,
+	.ENTER         = .RETURN,
+	.KP_ENTER      = .RETURN,
+	.BACKSPACE     = .BACKSPACE,
+}
+event :: proc "c" (ev: ^sa.Event) {
+
+	context = runtime.default_context()
+	mu_ctx := &state.mu_ctx
+	#partial switch ev.type {
+	case .MOUSE_DOWN:
+		mu.input_mouse_down(mu_ctx, i32(ev.mouse_x), i32(ev.mouse_y), mu.Mouse(ev.mouse_button))
+	case .MOUSE_UP:
+		mu.input_mouse_up(mu_ctx, i32(ev.mouse_x), i32(ev.mouse_y), mu.Mouse(ev.mouse_button))
+	case .MOUSE_MOVE:
+		mu.input_mouse_move(mu_ctx, i32(ev.mouse_x), i32(ev.mouse_y))
+	case .MOUSE_SCROLL:
+		mu.input_scroll(mu_ctx, 0, i32(ev.scroll_y))
+	case .KEY_DOWN:
+		if ev.key_code in key_map {
+			mu.input_key_down(mu_ctx, key_map[ev.key_code])
+		}
+	case .KEY_UP:
+		if ev.key_code in key_map {
+			mu.input_key_up(mu_ctx, key_map[ev.key_code])
+		}
+	case .CHAR:
+		mu.input_text(mu_ctx, fmt.tprint(rune(ev.char_code)))
+	}
+}
+
+cleanup :: proc "c" () {
+	sgl.shutdown()
+	sg.shutdown()
+}
+
+main :: proc() {
+	sa.run(
+		{
+			init_cb = init,
+			frame_cb = frame,
+			cleanup_cb = cleanup,
+			event_cb = event,
+			width = 800,
+			height = 600,
+			sample_count = 4,
+			window_title = "sokol microui",
+			icon = {sokol_default = true},
+		},
+	)
+}
 
 u8_slider :: proc(ctx: ^mu.Context, val: ^u8, lo, hi: u8) -> (res: mu.Result_Set) {
 	mu.push_id(ctx, uintptr(val))
